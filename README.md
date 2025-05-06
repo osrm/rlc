@@ -8,4 +8,4 @@ chmod +x rlc
 
 sudo mv rlc /usr/local/bin/
 
-run mdlinkcheck
+run rlc
