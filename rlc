@@ -7,7 +7,6 @@ declare -A urlLocations
 
 # find 명령어로 현재 및 하위 디렉터리의 .md, .mdx 파일들을 찾고,
 # awk를 사용하여 각 파일에서 Markdown 링크 형식([텍스트](URL))의 URL을 추출함.
-# 한 줄에 여러 링크가 포함된 경우도 모두 추출하도록 반복함.
 while IFS=: read -r file line url; do
     # URL이 비어있으면 스킵
     if [[ -z "$url" ]]; then
@@ -22,11 +21,7 @@ done < <(
     find . -type f \( -iname "*.md" -o -iname "*.mdx" \) -exec awk '
     {
         remainder = $0;
-        while(match(remainder, /
-
-\[[^]]+\]
-
-\((https?:\/\/[^)]+)\)/, arr)) {
+        while(match(remainder, /\[[^]]+\]\((https?:\/\/[^)]+)\)/, arr)) {
             print FILENAME ":" FNR ":" arr[1];
             remainder = substr(remainder, RSTART + RLENGTH);
         }
