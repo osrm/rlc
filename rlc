@@ -7,6 +7,10 @@ declare -A urlLocations
 
 # 1. Markdown 및 MDX 파일에서 URL 추출
 echo "🔗 파일에서 URL 추출 중..."
+file_count=0
+total_files=$(find . -type f \( -iname "*.md" -o -iname "*.mdx" \) | wc -l) # 총 파일 수 계산
+echo "총 검사 대상 파일 수: $total_files"
+
 find . -type f \( -iname "*.md" -o -iname "*.mdx" \) -exec awk '
 {
     remainder = $0;
@@ -34,11 +38,11 @@ echo "🔗 중복 제거된 URL 저장..."
 echo "${!urlLocations[@]}" | tr ' ' '\n' > url_list.txt
 
 # 2. URL 검사
-echo "🚀 URL 상태 검사 중..."
+echo "🚀 URL 상태 검사 중 (병렬 처리를 제한하여 CPU 사용량 절약)..."
 declare -A errorInfo
 
-# 병렬로 curl을 실행하여 상태 코드 확인 (HTTP 429는 무시)
-cat url_list.txt | xargs -P 10 -I {} bash -c '
+# 병렬로 curl을 실행하여 상태 코드 확인 (CPU 사용량을 낮추기 위해 최대 병렬 작업 수를 4로 제한)
+cat url_list.txt | xargs -P 4 -I {} bash -c '
     status=$(curl -o /dev/null -s -w "%{http_code}" "{}")
     if [[ "$status" -ge 400 && "$status" -ne 429 ]]; then
         echo "❌ {} (상태 코드: $status)"
