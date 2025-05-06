@@ -119,6 +119,10 @@ URL_FILE="$TEMP_DIR/urls.txt"
 RESULTS_FILE="$TEMP_DIR/results.txt"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
+# 진행 파일 생성 및 초기화
+PROGRESS_FILE="$TEMP_DIR/progress.txt"
+echo "0" > "$PROGRESS_FILE"
+
 # URL 추출 함수 - 별도의 파일로 저장하여 실행
 URL_EXTRACT_SCRIPT="$TEMP_DIR/extract.sh"
 cat > "$URL_EXTRACT_SCRIPT" << 'EOF'
@@ -202,8 +206,6 @@ echo -e "\n${PURPLE}URL 유효성 검사 중... (병렬 처리 $MAX_PARALLEL)${N
 echo
 
 # 진행 바 관련 변수
-PROGRESS_FILE="$TEMP_DIR/progress.txt"
-echo "0" > "$PROGRESS_FILE"
 processed=0
 
 # 진행 상황 표시 함수
@@ -211,8 +213,16 @@ show_progress() {
     local total=$1
     while true; do
         if [ -f "$PROGRESS_FILE" ]; then
-            local current=$(cat "$PROGRESS_FILE")
-            local percent=$((current * 100 / total))
+            local current=$(cat "$PROGRESS_FILE" 2>/dev/null || echo "0")
+            if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+                current=0
+            fi
+            
+            local percent=0
+            if [ "$total" -gt 0 ]; then
+                percent=$((current * 100 / total))
+            fi
+            
             local completed=$((percent / 2))
             local remaining=$((50 - completed))
             
@@ -266,13 +276,16 @@ else
     fi
 fi
 
-# 진행 카운터 증가 (flock을 사용하여 동시 접근 방지)
-if command -v flock >/dev/null 2>&1; then
-    flock -x "$progress_file" bash -c "echo \$(($(cat \"$progress_file\")+1)) > \"$progress_file\""
-else
-    # flock이 없으면 임시 파일을 이용한 대체 방법
-    tmp_count=$(($(cat "$progress_file")+1))
-    echo "$tmp_count" > "$progress_file.tmp"
+# 진행 카운터 증가 (원자적으로 처리)
+if [ -f "$progress_file" ]; then
+    # 진행 상황 파일 읽기
+    current=$(cat "$progress_file" 2>/dev/null || echo "0")
+    if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+        current=0
+    fi
+    
+    # 증가 및 저장
+    echo $((current + 1)) > "$progress_file.tmp"
     mv "$progress_file.tmp" "$progress_file"
 fi
 EOF
@@ -290,20 +303,23 @@ if [ -n "$PROGRESS_PID" ]; then
 fi
 
 # 결과 분석
+success_count=0
+rate_limited=0
+fail_count=0
+error_count=0
+
 if [ -f "$RESULTS_FILE" ] && [ -s "$RESULTS_FILE" ]; then
     success_count=$(grep -c "^SUCCESS" "$RESULTS_FILE" || echo 0)
     rate_limited=$(grep -c "^RATE_LIMITED" "$RESULTS_FILE" || echo 0)
     fail_count=$(grep -c "^FAIL" "$RESULTS_FILE" || echo 0)
     error_count=$(grep -c "^ERROR" "$RESULTS_FILE" || echo 0)
-    
-    # 실패한 URL 목록 추출
-    INVALID_URLS=()
-    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
-        while IFS= read -r line; do
-            INVALID_URLS+=("$line")
-        done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
-    fi
 fi
+
+# 정수 확인 및 기본값 설정
+if ! [[ "$success_count" =~ ^[0-9]+$ ]]; then success_count=0; fi
+if ! [[ "$rate_limited" =~ ^[0-9]+$ ]]; then rate_limited=0; fi
+if ! [[ "$fail_count" =~ ^[0-9]+$ ]]; then fail_count=0; fi
+if ! [[ "$error_count" =~ ^[0-9]+$ ]]; then error_count=0; fi
 
 # 결과 요약
 total=$((success_count + rate_limited + fail_count + error_count))
@@ -321,14 +337,14 @@ echo -e "  - ${RED}오류${NC}: $error_count"
 if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
     echo -e "\n${CYAN}유효하지 않은 URL 목록:${NC}"
     
-    if [ -f "$RESULTS_FILE" ]; then
-        while IFS= read -r line; do
-            IFS="|" read -r status url file <<< "$line"
+    if [ -f "$RESULTS_FILE" ] && [ -s "$RESULTS_FILE" ]; then
+        grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | while IFS= read -r line; do
+            IFS="|" read -r result status url file <<< "$line"
             echo -e "${RED}✘${NC} $url"
             echo -e "  위치: $file"
             echo -e "  상태: $status"
             echo
-        done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+        done
     fi
 fi
 
@@ -343,17 +359,17 @@ if [ -n "$OUTPUT_FILE" ]; then
     echo "  - 오류: $error_count" >> "$OUTPUT_FILE"
     echo >> "$OUTPUT_FILE"
     
-    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ] && [ -f "$RESULTS_FILE" ]; then
+    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ] && [ -f "$RESULTS_FILE" ] && [ -s "$RESULTS_FILE" ]; then
         echo "유효하지 않은 URL 목록:" >> "$OUTPUT_FILE"
         echo >> "$OUTPUT_FILE"
         
-        while IFS= read -r line; do
-            IFS="|" read -r status url file <<< "$line"
+        grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | while IFS= read -r line; do
+            IFS="|" read -r result status url file <<< "$line"
             echo "✘ $url" >> "$OUTPUT_FILE"
             echo "  위치: $file" >> "$OUTPUT_FILE"
             echo "  상태: $status" >> "$OUTPUT_FILE"
             echo >> "$OUTPUT_FILE"
-        done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+        done
     fi
     
     echo -e "\n결과를 ${BLUE}$OUTPUT_FILE${NC} 파일에 저장했습니다."
