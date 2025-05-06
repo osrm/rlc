@@ -17,6 +17,7 @@ IGNORE_PATTERNS=()
 FAILED_ONLY=false
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 MAX_PARALLEL=10  # 동시에 실행할 최대 프로세스 수
+DEBUG=false
 
 # 도움말 표시
 function show_help {
@@ -31,6 +32,7 @@ function show_help {
     echo "  -i, --ignore PATTERN 무시할 URL 패턴 (여러 개 가능)"
     echo "  -f, --failed-only    실패한 URL만 출력"
     echo "  -j, --jobs N         동시에 실행할 작업 수 (기본값: 10)"
+    echo "  -d, --debug          디버그 모드 활성화"
     echo "  -h, --help           도움말 표시"
     echo
     echo "예시:"
@@ -66,6 +68,10 @@ while [[ $# -gt 0 ]]; do
             MAX_PARALLEL="$2"
             shift 2
             ;;
+        -d|--debug)
+            DEBUG=true
+            shift
+            ;;
         -h|--help)
             show_help
             ;;
@@ -75,6 +81,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# 디버그 모드 함수
+debug() {
+    if [ "$DEBUG" = true ]; then
+        echo -e "${BLUE}[DEBUG]${NC} $1"
+    fi
+}
 
 # 저장소 경로 검증
 if [ ! -d "$REPO_PATH" ]; then
@@ -123,60 +136,101 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 PROGRESS_FILE="$TEMP_DIR/progress.txt"
 echo "0" > "$PROGRESS_FILE"
 
-# URL 추출 함수 - 별도의 파일로 저장하여 실행
+# URL 추출 스크립트 생성
 URL_EXTRACT_SCRIPT="$TEMP_DIR/extract.sh"
 cat > "$URL_EXTRACT_SCRIPT" << 'EOF'
 #!/bin/bash
+
 file="$1"
+output_prefix="$2"
+debug_mode="$3"
 
-# 링크 찾기 - 정규식을 직접 사용하지 않고 grep과 sed를 조합
-# 1. Markdown 링크 형식 [text](url)
-grep -o -E '\[[^\]]*\]\(https?://[^)]*\)' "$file" | sed -E 's/\[[^\]]*\]\((https?:\/\/[^)]*)\)/\1/g' > "$2.link1"
+debug() {
+    if [ "$debug_mode" = "true" ]; then
+        echo "[DEBUG] $1" >&2
+    fi
+}
 
-# 2. <url> 형식
-grep -o -E '<https?://[^>]*>' "$file" | sed -E 's/<(https?:\/\/[^>]*)>/\1/g' > "$2.link2"
+debug "파일 처리 중: $file"
 
-# URL 결합 및 파일 경로 추가
-cat "$2.link1" "$2.link2" | while read -r url; do
-    # URL 정리 (후행 문자 제거)
-    clean_url=$(echo "$url" | sed -e 's/[,.;:]$//')
+# 파일이 존재하고 읽을 수 있는지 확인
+if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    debug "파일을 읽을 수 없음: $file"
+    exit 1
+fi
+
+# 임시 파일 생성
+temp_all="$output_prefix.all"
+temp_urls="$output_prefix.urls"
+> "$temp_all"
+
+# 1. 마크다운 링크 [text](url) 추출
+grep -o -E '\[[^\]]*\]\(https?://[^)]*\)' "$file" | sed -E 's/.*\((https?:\/\/[^)]*)\).*/\1/g' >> "$temp_all" 2>/dev/null
+
+# 2. <url> 형식 링크 추출
+grep -o -E '<https?://[^>]*>' "$file" | sed -E 's/<(https?:\/\/[^>]*)>/\1/g' >> "$temp_all" 2>/dev/null
+
+# 3. 일반 텍스트 URL 추출 (마크다운 코드 블록 내 URL 포함)
+grep -o -E '(https?://[a-zA-Z0-9\.\-_]+\.[a-zA-Z]{2,}[a-zA-Z0-9\.\-_/\?\&=%;]*)' "$file" | grep -v -E '^\)' >> "$temp_all" 2>/dev/null
+
+# 4. 각 줄에서 "https://" 또는 "http://"로 시작하는 URL 추출 (코드 블록 내 URL 포함)
+grep -o -E '(https?://[^[:space:]\]\)\>\"\'\`]*)' "$file" >> "$temp_all" 2>/dev/null
+
+# URL 정리 및 중복 제거
+sort -u "$temp_all" | while read -r url; do
+    # URL 정리 (후행 쉼표, 점, 세미콜론, 따옴표 등 제거)
+    clean_url=$(echo "$url" | sed -E 's/[,.;:"\`'\'']*$//g')
     echo "$clean_url|$file"
-done
+done > "$temp_urls"
 
-rm -f "$2.link1" "$2.link2"
+# URL 수 출력
+url_count=$(wc -l < "$temp_urls")
+debug "파일에서 추출된 URL 수: $url_count"
+
+# 결과 출력
+cat "$temp_urls"
+
+# 임시 파일 정리
+rm -f "$temp_all" "$temp_urls"
 EOF
 
 chmod +x "$URL_EXTRACT_SCRIPT"
 
 # 병렬로 URL 추출
-echo "$MD_FILES" | xargs -I{} -P "$MAX_PARALLEL" bash -c '"$1" "{}" "$2/$(echo "{}" | md5sum | cut -d" " -f1)"' -- "$URL_EXTRACT_SCRIPT" "$TEMP_DIR" > "$URL_FILE"
+debug "URL 추출 시작"
+echo "$MD_FILES" | xargs -I{} -P "$MAX_PARALLEL" bash -c '"$1" "{}" "$2/$(echo "{}" | md5sum | cut -d" " -f1)" "$3"' -- "$URL_EXTRACT_SCRIPT" "$TEMP_DIR" "$DEBUG" > "$URL_FILE"
+
+# 추출 결과 확인
+if [ ! -s "$URL_FILE" ]; then
+    debug "URL 추출 결과가 비어 있음"
+    echo -e "${YELLOW}경고: URL을 찾을 수 없습니다.${NC}"
+    exit 0
+fi
 
 # URL과 파일 맵 구성 및 무시 패턴 적용
-declare -A URL_MAP
 URL_COUNT=0
 FILTERED_URL_FILE="$TEMP_DIR/filtered_urls.txt"
 > "$FILTERED_URL_FILE"
 
-if [ -s "$URL_FILE" ]; then
-    while IFS= read -r line; do
-        IFS='|' read -r url file <<< "$line"
-        
-        # 무시할 패턴인지 확인
-        ignore=false
-        for pattern in "${IGNORE_PATTERNS[@]}"; do
-            if [[ "$url" =~ $pattern ]]; then
-                ignore=true
-                break
-            fi
-        done
-        
-        if [ "$ignore" = false ]; then
-            echo "$url|$file" >> "$FILTERED_URL_FILE"
-            URL_MAP["$url"]=1
-            ((URL_COUNT++))
+debug "무시 패턴 적용 중"
+while IFS= read -r line; do
+    IFS='|' read -r url file <<< "$line"
+    
+    # 무시할 패턴인지 확인
+    ignore=false
+    for pattern in "${IGNORE_PATTERNS[@]}"; do
+        if [[ "$url" =~ $pattern ]]; then
+            ignore=true
+            debug "무시된 URL: $url (패턴: $pattern)"
+            break
         fi
-    done < "$URL_FILE"
-fi
+    done
+    
+    if [ "$ignore" = false ]; then
+        echo "$url|$file" >> "$FILTERED_URL_FILE"
+        ((URL_COUNT++))
+    fi
+done < "$URL_FILE"
 
 # 중복 URL 제거한 파일 생성
 UNIQUE_URL_FILE="$TEMP_DIR/unique_urls.txt"
@@ -251,50 +305,72 @@ user_agent="$2"
 timeout="$3"
 results_file="$4"
 progress_file="$5"
-relative_path=$(realpath --relative-to="$(pwd)" "$file")
+debug_mode="$6"
+relative_path=$(realpath --relative-to="$(pwd)" "$file" 2>/dev/null || echo "$file")
+
+debug() {
+    if [ "$debug_mode" = "true" ]; then
+        echo "[DEBUG] $1" >&2
+    fi
+}
+
+debug "URL 검사: $url"
+
+# 유효한 URL 확인
+if [[ ! "$url" =~ ^https?:// ]]; then
+    debug "잘못된 URL 형식: $url"
+    echo "ERROR|잘못된 URL 형식|$url|$relative_path" >> "$results_file"
+    
+    # 진행 카운터 증가
+    current=$(cat "$progress_file" 2>/dev/null || echo "0")
+    if ! [[ "$current" =~ ^[0-9]+$ ]]; then current=0; fi
+    echo $((current + 1)) > "$progress_file.tmp"
+    mv "$progress_file.tmp" "$progress_file"
+    exit 0
+fi
 
 # curl로 URL 검사
 status=$(curl -A "$user_agent" -o /dev/null -s -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" -L -I "$url" 2>/dev/null)
+debug "HEAD 요청 결과 (URL: $url): $status"
 
 # HEAD 요청 실패 시 GET 요청 시도
 if [[ $status -ge 400 || $status -eq 0 ]]; then
+    debug "GET 요청으로 재시도: $url"
     status=$(curl -A "$user_agent" -o /dev/null -s -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" -L "$url" 2>/dev/null)
+    debug "GET 요청 결과: $status"
 fi
 
 # 결과 저장
 if [[ $status -ge 200 && $status -lt 400 ]] || [[ $status -eq 429 ]]; then
     if [[ $status -eq 429 ]]; then
+        debug "속도 제한 감지 (URL: $url)"
         echo "RATE_LIMITED|$status|$url|$relative_path" >> "$results_file"
     else
+        debug "성공 (URL: $url, 상태: $status)"
         echo "SUCCESS|$status|$url|$relative_path" >> "$results_file"
     fi
 else
     if [[ $status -eq 0 ]]; then
+        debug "접속 실패 (URL: $url)"
         echo "ERROR|접속 실패|$url|$relative_path" >> "$results_file"
     else
+        debug "실패 (URL: $url, 상태: $status)"
         echo "FAIL|$status|$url|$relative_path" >> "$results_file"
     fi
 fi
 
-# 진행 카운터 증가 (원자적으로 처리)
-if [ -f "$progress_file" ]; then
-    # 진행 상황 파일 읽기
-    current=$(cat "$progress_file" 2>/dev/null || echo "0")
-    if ! [[ "$current" =~ ^[0-9]+$ ]]; then
-        current=0
-    fi
-    
-    # 증가 및 저장
-    echo $((current + 1)) > "$progress_file.tmp"
-    mv "$progress_file.tmp" "$progress_file"
-fi
+# 진행 카운터 증가
+current=$(cat "$progress_file" 2>/dev/null || echo "0")
+if ! [[ "$current" =~ ^[0-9]+$ ]]; then current=0; fi
+echo $((current + 1)) > "$progress_file.tmp"
+mv "$progress_file.tmp" "$progress_file"
 EOF
 
 chmod +x "$URL_CHECK_SCRIPT"
 
 # 병렬로 URL 검사
 if [ -s "$UNIQUE_URL_FILE" ]; then
-    cat "$UNIQUE_URL_FILE" | xargs -I{} -P "$MAX_PARALLEL" "$URL_CHECK_SCRIPT" "{}" "$USER_AGENT" "$TIMEOUT" "$RESULTS_FILE" "$PROGRESS_FILE"
+    cat "$UNIQUE_URL_FILE" | xargs -I{} -P "$MAX_PARALLEL" "$URL_CHECK_SCRIPT" "{}" "$USER_AGENT" "$TIMEOUT" "$RESULTS_FILE" "$PROGRESS_FILE" "$DEBUG"
 fi
 
 # 진행 바 프로세스 종료
@@ -323,6 +399,16 @@ if ! [[ "$error_count" =~ ^[0-9]+$ ]]; then error_count=0; fi
 
 # 결과 요약
 total=$((success_count + rate_limited + fail_count + error_count))
+
+# 샘플 URL 출력 (디버그용)
+if [ "$DEBUG" = true ] && [ -s "$UNIQUE_URL_FILE" ]; then
+    echo -e "\n${BLUE}[DEBUG] 추출된 URL 샘플 (최대 10개):${NC}"
+    head -n 10 "$UNIQUE_URL_FILE" | awk -F'|' '{print "  - " $1 " (파일: " $2 ")"}'
+    if [ "$UNIQUE_URL_COUNT" -gt 10 ]; then
+        echo "  ... 외 $((UNIQUE_URL_COUNT-10))개"
+    fi
+    echo
+fi
 
 echo -e "\n${CYAN}결과 요약:${NC}"
 echo -e "검사한 URL 수: $total"
