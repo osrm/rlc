@@ -2,16 +2,11 @@
 
 echo "🔍 Markdown 및 MDX 링크 검사 중..."
 
-# URL의 위치 정보(파일명:라인번호)를 저장할 associative array (Bash 4 이상 필요)
 declare -A urlLocations
 
-# find 명령어로 현재 및 하위 디렉터리의 .md, .mdx 파일들을 찾고,
-# awk를 사용하여 각 파일에서 Markdown 링크 형식([텍스트](URL))의 URL을 추출함.
+# 링크 추출
 while IFS=: read -r file line url; do
-    # URL이 비어있으면 스킵
-    if [[ -z "$url" ]]; then
-        continue
-    fi
+    [[ -z "$url" ]] && continue
     if [[ -n "${urlLocations[$url]}" ]]; then
         urlLocations["$url"]+=", ${file}:${line}"
     else
@@ -29,31 +24,60 @@ done < <(
     ' {} +
 )
 
-# 검사 대상 링크 수 출력
 count=${#urlLocations[@]}
 echo "🔗 검사 대상 링크 수: $count"
 echo
 
-# URL 검사: 각 URL에 대해 curl로 HTTP 상태코드를 받아 검사
-declare -A errorInfo
-for url in "${!urlLocations[@]}"; do
-    status=$(curl -o /dev/null -s -w "%{http_code}" "$url")
-    if [[ "$status" -ge 200 && "$status" -lt 400 ]]; then
-        echo "✅ $url"
-    else
-        echo "❌ $url (Status: $status)"
-        errorInfo["$url"]="$status | 위치: ${urlLocations[$url]}"
-    fi
-done
+# 임시 결과 파일
+tmp_output=$(mktemp)
+> "$tmp_output"
 
-# 오류가 발생한 링크 목록 최종 출력
-if [ ${#errorInfo[@]} -gt 0 ]; then
-    echo
+# 병렬 링크 검사 함수
+check_url() {
+    local url="$1"
+    local location="$2"
+    local status
+    status=$(curl -o /dev/null -s -w "%{http_code}" "$url")
+
+    if [[ "$status" -ge 200 && "$status" -lt 400 ]]; then
+        echo "✅ $url" >> "$tmp_output"
+    elif [[ "$status" == "429" ]]; then
+        echo "⚠️  $url | 429 Too Many Requests (무시됨)" >> "$tmp_output"
+    else
+        echo "❌ $url | $status | 위치: $location" >> "$tmp_output"
+    fi
+}
+
+export -f check_url
+export tmp_output
+
+# 병렬 실행 (10개씩)
+printf "%s\n" "${!urlLocations[@]}" | \
+    xargs -n1 -P10 -I{} bash -c 'check_url "$@"' _ "{}" "${urlLocations[{}]}"
+
+# 결과 출력
+echo
+echo "📄 검사 결과:"
+grep -E "^✅|^⚠️" "$tmp_output" | sort
+echo
+
+# 오류 링크 정리 및 출력
+errors=$(grep "^❌" "$tmp_output")
+if [[ -n "$errors" ]]; then
     echo "‼️ 오류가 발생한 링크 목록:"
-    for url in "${!errorInfo[@]}"; do
-        echo "- $url → ${errorInfo[$url]}"
-    done
+    echo "────────────────────────────────────────────"
+    while IFS= read -r line; do
+        url=$(echo "$line" | cut -d '|' -f1 | sed 's/^❌ //')
+        status=$(echo "$line" | cut -d '|' -f2 | xargs)
+        location=$(echo "$line" | cut -d '|' -f3- | sed 's/^ 위치: //')
+        echo "🔗 $url"
+        echo "   └─ 상태 코드: $status"
+        echo "   └─ 위치: $location"
+        echo
+    done <<< "$errors"
 else
-    echo
     echo "모든 링크가 정상입니다!"
 fi
+
+# 임시 파일 삭제
+rm "$tmp_output"
