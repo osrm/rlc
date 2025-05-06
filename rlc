@@ -1,0 +1,334 @@
+#!/bin/bash
+
+# 색상 정의
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# 기본 변수 설정
+REPO_PATH="."
+TIMEOUT=10
+OUTPUT_FILE=""
+IGNORE_PATTERNS=()
+FAILED_ONLY=false
+USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+MAX_PARALLEL=10  # 동시에 실행할 최대 프로세스 수
+
+# 도움말 표시
+function show_help {
+    echo -e "${CYAN}Markdown 파일(.md, .mdx)에서 URL 유효성 검사${NC}"
+    echo
+    echo "사용법: $0 [옵션]"
+    echo
+    echo "옵션:"
+    echo "  -p, --path PATH      검사할 저장소 경로 (기본값: 현재 디렉토리)"
+    echo "  -t, --timeout SEC    URL 요청 타임아웃 시간(초) (기본값: 10)"
+    echo "  -o, --output FILE    결과를 저장할 파일 경로"
+    echo "  -i, --ignore PATTERN 무시할 URL 패턴 (여러 개 가능)"
+    echo "  -f, --failed-only    실패한 URL만 출력"
+    echo "  -j, --jobs N         동시에 실행할 작업 수 (기본값: 10)"
+    echo "  -h, --help           도움말 표시"
+    echo
+    echo "예시:"
+    echo "  $0 --path ./my-repo --timeout 5 --output result.txt --jobs 20"
+    echo "  $0 --ignore 'example.com' --ignore 'test.org'"
+    exit 0
+}
+
+# 명령행 인수 파싱
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -p|--path)
+            REPO_PATH="$2"
+            shift 2
+            ;;
+        -t|--timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -i|--ignore)
+            IGNORE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        -f|--failed-only)
+            FAILED_ONLY=true
+            shift
+            ;;
+        -j|--jobs)
+            MAX_PARALLEL="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo -e "${RED}오류: 알 수 없는 옵션 $1${NC}"
+            show_help
+            ;;
+    esac
+done
+
+# 저장소 경로 검증
+if [ ! -d "$REPO_PATH" ]; then
+    echo -e "${RED}오류: $REPO_PATH는 유효한 디렉토리가 아닙니다.${NC}"
+    exit 1
+fi
+
+echo -e "${CYAN}URL 링크 검사기${NC}"
+echo -e "저장소 경로: ${BLUE}$REPO_PATH${NC}"
+echo -e "타임아웃: ${BLUE}$TIMEOUT초${NC}"
+echo -e "병렬 작업 수: ${BLUE}$MAX_PARALLEL${NC}"
+
+# 결과 저장 파일 준비
+if [ -n "$OUTPUT_FILE" ]; then
+    echo "URL 검사 결과" > "$OUTPUT_FILE"
+    echo "=============" >> "$OUTPUT_FILE"
+    echo >> "$OUTPUT_FILE"
+    echo "저장소 경로: $REPO_PATH" >> "$OUTPUT_FILE"
+    echo "타임아웃: $TIMEOUT초" >> "$OUTPUT_FILE"
+    echo "병렬 작업 수: $MAX_PARALLEL" >> "$OUTPUT_FILE"
+    echo >> "$OUTPUT_FILE"
+fi
+
+# .md와.mdx 파일 찾기 (find 명령 최적화)
+echo -e "\n${PURPLE}Markdown 파일 검색 중...${NC}"
+MD_FILES=$(find "$REPO_PATH" -type f \( -name "*.md" -o -name "*.mdx" \) -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/build/*")
+FILE_COUNT=$(echo "$MD_FILES" | grep -c "^" || echo 0)
+
+if [ "$FILE_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}경고: .md 또는 .mdx 파일을 찾을 수 없습니다.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}발견된 Markdown 파일 수: $FILE_COUNT${NC}"
+
+# URL 추출
+echo -e "\n${PURPLE}URL 추출 중...${NC}"
+
+# 임시 파일 생성
+TEMP_DIR=$(mktemp -d)
+URL_FILE="$TEMP_DIR/urls.txt"
+RESULTS_FILE="$TEMP_DIR/results.txt"
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+# URL 추출을 병렬로 처리
+{
+    echo "$MD_FILES" | xargs -I{} -P "$MAX_PARALLEL" bash -c '
+        file="$1"
+        # grep을 한 번만 실행하여 모든 패턴 매칭
+        grep -o -P "\[(.*?)\]\((https?://[^)]+)\)|<(https?://[^>]+)>" "$file" | while read -r line; do
+            if [[ $line =~ \[(.*)\]\((https?://[^)]+) ]]; then
+                # [텍스트](URL) 형식
+                url="${BASH_REMATCH[2]}"
+            elif [[ $line =~ \<(https?://[^>]+) ]]; then
+                # <URL> 형식
+                url="${BASH_REMATCH[1]}"
+            else
+                continue
+            fi
+            
+            # URL 정리 (후행 문자 제거)
+            clean_url=$(echo "$url" | sed -e "s/[,.;:]$//")
+            
+            # 파일 경로와 함께 URL 출력
+            echo "$clean_url|$file"
+        done
+    ' -- {}
+} > "$URL_FILE"
+
+# URL과 파일 맵 구성 및 무시 패턴 적용
+declare -A URL_MAP
+URL_COUNT=0
+FILTERED_URL_FILE="$TEMP_DIR/filtered_urls.txt"
+
+cat "$URL_FILE" | while read -r line; do
+    IFS="|" read -r url file <<< "$line"
+    
+    # 무시할 패턴인지 확인
+    ignore=false
+    for pattern in "${IGNORE_PATTERNS[@]}"; do
+        if [[ "$url" =~ $pattern ]]; then
+            ignore=true
+            break
+        fi
+    done
+    
+    if [ "$ignore" = false ]; then
+        echo "$url|$file" >> "$FILTERED_URL_FILE"
+        URL_MAP["$url"]=1
+        ((URL_COUNT++))
+    fi
+done
+
+# 중복 URL 제거한 파일 생성
+UNIQUE_URL_FILE="$TEMP_DIR/unique_urls.txt"
+sort -u "$FILTERED_URL_FILE" | awk -F'|' '!seen[$1]++ {print $0}' > "$UNIQUE_URL_FILE"
+UNIQUE_URL_COUNT=$(wc -l < "$UNIQUE_URL_FILE")
+
+echo -e "${GREEN}추출된 URL 수: $URL_COUNT (고유 URL: $UNIQUE_URL_COUNT)${NC}"
+
+if [ "$UNIQUE_URL_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}URL을 찾을 수 없습니다.${NC}"
+    exit 0
+fi
+
+# 결과 저장용 변수
+success_count=0
+fail_count=0
+error_count=0
+rate_limited=0
+
+# URL 검사
+echo -e "\n${PURPLE}URL 유효성 검사 중... (병렬 처리 $MAX_PARALLEL)${NC}"
+echo
+
+# 진행 바 관련 변수
+PROGRESS_FILE="$TEMP_DIR/progress.txt"
+echo "0" > "$PROGRESS_FILE"
+processed=0
+
+# 진행 상황 표시 함수
+show_progress() {
+    local total=$1
+    while true; do
+        if [ -f "$PROGRESS_FILE" ]; then
+            local current=$(cat "$PROGRESS_FILE")
+            local percent=$((current * 100 / total))
+            local completed=$((percent / 2))
+            local remaining=$((50 - completed))
+            
+            # 진행 바 생성
+            printf "\r[%-${completed}s%-${remaining}s] %d%% (%d/%d)" "$(printf '#%.0s' $(seq 1 $completed))" "$(printf ' %.0s' $(seq 1 $remaining))" "$percent" "$current" "$total"
+            
+            if [ "$current" -ge "$total" ]; then
+                echo
+                break
+            fi
+        fi
+        sleep 0.2
+    done
+}
+
+# 백그라운드에서 진행 상황 표시
+show_progress "$UNIQUE_URL_COUNT" &
+PROGRESS_PID=$!
+
+# 병렬로 URL 검사
+cat "$UNIQUE_URL_FILE" | xargs -I{} -P "$MAX_PARALLEL" bash -c '
+    IFS="|" read -r url file <<< "$1"
+    relative_path=$(realpath --relative-to="$(pwd)" "$file")
+    
+    # curl로 URL 검사
+    status=$(curl -A "$2" -o /dev/null -s -w "%{http_code}" --connect-timeout "$3" --max-time "$3" -L -I "$url" 2>/dev/null)
+    
+    # HEAD 요청 실패 시 GET 요청 시도
+    if [[ $status -ge 400 || $status -eq 0 ]]; then
+        status=$(curl -A "$2" -o /dev/null -s -w "%{http_code}" --connect-timeout "$3" --max-time "$3" -L "$url" 2>/dev/null)
+    fi
+    
+    # 결과 저장
+    if [[ $status -ge 200 && $status -lt 400 ]] || [[ $status -eq 429 ]]; then
+        if [[ $status -eq 429 ]]; then
+            echo "RATE_LIMITED|$status|$url|$relative_path" >> "$4"
+        else
+            echo "SUCCESS|$status|$url|$relative_path" >> "$4"
+        fi
+    else
+        if [[ $status -eq 0 ]]; then
+            echo "ERROR|접속 실패|$url|$relative_path" >> "$4"
+        else
+            echo "FAIL|$status|$url|$relative_path" >> "$4"
+        fi
+    fi
+    
+    # 진행 카운터 증가
+    flock -x "$5" bash -c "echo \$(($(cat \"$5\")+1)) > \"$5\""
+' -- {} "$USER_AGENT" "$TIMEOUT" "$RESULTS_FILE" "$PROGRESS_FILE"
+
+# 진행 바 프로세스 종료
+if [ -n "$PROGRESS_PID" ]; then
+    wait "$PROGRESS_PID" 2>/dev/null || true
+fi
+
+# 결과 분석
+if [ -f "$RESULTS_FILE" ]; then
+    success_count=$(grep -c "^SUCCESS" "$RESULTS_FILE" || echo 0)
+    rate_limited=$(grep -c "^RATE_LIMITED" "$RESULTS_FILE" || echo 0)
+    fail_count=$(grep -c "^FAIL" "$RESULTS_FILE" || echo 0)
+    error_count=$(grep -c "^ERROR" "$RESULTS_FILE" || echo 0)
+    
+    # 실패한 URL 목록 추출
+    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
+        INVALID_URLS=()
+        while IFS= read -r line; do
+            INVALID_URLS+=("$line")
+        done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+    fi
+fi
+
+# 결과 요약
+total=$((success_count + rate_limited + fail_count + error_count))
+
+echo -e "\n${CYAN}결과 요약:${NC}"
+echo -e "검사한 URL 수: $total"
+echo -e "  - ${GREEN}성공${NC}: $success_count"
+if [ "$rate_limited" -gt 0 ]; then
+    echo -e "  - ${YELLOW}속도 제한${NC}: $rate_limited"
+fi
+echo -e "  - ${RED}실패${NC}: $fail_count"
+echo -e "  - ${RED}오류${NC}: $error_count"
+
+# 실패한 URL 목록 표시
+if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
+    echo -e "\n${CYAN}유효하지 않은 URL 목록:${NC}"
+    
+    while IFS= read -r line; do
+        IFS="|" read -r status url file <<< "$line"
+        echo -e "${RED}✘${NC} $url"
+        echo -e "  위치: $file"
+        echo -e "  상태: $status"
+        echo
+    done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+fi
+
+# 결과 파일 저장
+if [ -n "$OUTPUT_FILE" ]; then
+    echo "검사한 URL 수: $total" >> "$OUTPUT_FILE"
+    echo "  - 성공: $success_count" >> "$OUTPUT_FILE"
+    if [ "$rate_limited" -gt 0 ]; then
+        echo "  - 속도 제한: $rate_limited" >> "$OUTPUT_FILE"
+    fi
+    echo "  - 실패: $fail_count" >> "$OUTPUT_FILE"
+    echo "  - 오류: $error_count" >> "$OUTPUT_FILE"
+    echo >> "$OUTPUT_FILE"
+    
+    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
+        echo "유효하지 않은 URL 목록:" >> "$OUTPUT_FILE"
+        echo >> "$OUTPUT_FILE"
+        
+        while IFS= read -r line; do
+            IFS="|" read -r status url file <<< "$line"
+            echo "✘ $url" >> "$OUTPUT_FILE"
+            echo "  위치: $file" >> "$OUTPUT_FILE"
+            echo "  상태: $status" >> "$OUTPUT_FILE"
+            echo >> "$OUTPUT_FILE"
+        done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+    fi
+    
+    echo -e "\n결과를 ${BLUE}$OUTPUT_FILE${NC} 파일에 저장했습니다."
+fi
+
+# 종료 코드 반환 (실패 또는 오류가 있으면 1, 그렇지 않으면 0)
+if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi
