@@ -1,27 +1,50 @@
 #!/bin/bash
 
+echo "🔍 Markdown 및 MDX 링크 검사 중..."
 
-echo "🔍 Markdown 링크 검사 중..."
+# 각 URL에 대해, "파일:라인" 위치들을 저장할 associative array 선언 (Bash 4 이상 필요)
+declare -A urlLocations
 
-# Markdown 파일을 재귀적으로 검색하여 [text](url) 패턴의 http/https 링크만 추출
-grep -rPo '\[.*?\]\(\Khttps?://[^\)]+' --include="*.md","*.mdx" . > /tmp/all_links.txt
+# .md 및 .mdx 파일 모두에서 URL을 추출하여, 파일명:라인번호:URL 형식으로 읽어들임
+while IFS=: read -r file line url; do
+    # 만약 URL에 이미 위치 정보가 있다면 콤마로 구분하여 추가
+    if [[ -n "${urlLocations[$url]}" ]]; then
+        urlLocations[$url]+=", ${file}:${line}"
+    else
+        urlLocations[$url]="${file}:${line}"
+    fi
+done < <(find . -type f \( -iname "*.md" -o -iname "*.mdx" \) -exec grep -Pno '
 
-# 중복 제거
-sort -u /tmp/all_links.txt > /tmp/unique_links.txt
+\[.*?\]
 
+\(\Khttps?://[^\)]+' {} \;)
 
-# 각 파일마다 링크 검사
-while IFS= read -r file; do
-    while IFS= read -r url; do
-        # 해당 파일에 포함된 링크인지 확인
-        if grep -q "$url" "$file"; then
-            status=$(curl -o /dev/null -s -w "%{http_code}" "$url")
-            if [[ "$status" -ge 400 || "$status" -eq 000 ]]; then
-                echo "❌ $file → $url (Status: $status)"
-            fi
-        fi
-    done < /tmp/unique_links.txt
-done < <(find . -type f -name "*.md")
+count=${#urlLocations[@]}
+echo "🔗 검사 대상 링크 수: $count"
+echo
 
-# 임시파일 삭제
-rm /tmp/all_links.txt /tmp/unique_links.txt
+# 오류가 발생한 링크의 정보를 저장하기 위한 associative array
+declare -A errorInfo
+
+# 각 고유 링크에 대해 curl로 HTTP 상태 코드 검사
+for url in "${!urlLocations[@]}"; do
+    status=$(curl -o /dev/null -s -w "%{http_code}" "$url")
+    if [[ "$status" -ge 200 && "$status" -lt 400 ]]; then
+        echo "✅ $url"
+    else
+        echo "❌ $url (Status: $status)"
+        errorInfo["$url"]="$status | 위치: ${urlLocations[$url]}"
+    fi
+done
+
+# 검사 후, 오류가 발생한 링크와 위치들을 목록으로 출력
+if [ ${#errorInfo[@]} -gt 0 ]; then
+    echo
+    echo "‼️ 오류가 발생한 링크 목록:"
+    for url in "${!errorInfo[@]}"; do
+        echo "- $url → ${errorInfo[$url]}"
+    done
+else
+    echo
+    echo "모든 링크가 정상입니다!"
+fi
