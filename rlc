@@ -51,9 +51,9 @@ check_url() {
 export -f check_url
 export tmp_output
 
-# 병렬 실행 (10개씩)
+# 병렬 실행 (3개씩)
 printf "%s\n" "${!urlLocations[@]}" | \
-    xargs -n1 -P10 -I{} bash -c 'check_url "$@"' _ "{}" "${urlLocations[{}]}"
+    xargs -n1 -P3 -I{} bash -c 'check_url "$@"' _ "{}" "${urlLocations[{}]}"
 
 # 결과 출력
 echo
