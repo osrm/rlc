@@ -2,6 +2,7 @@
 
 echo "🔍 Markdown 및 MDX 링크 검사 중..."
 
+# 링크 위치 저장용 Associative Array
 declare -A urlLocations
 
 # 링크 추출
@@ -32,7 +33,7 @@ echo
 tmp_output=$(mktemp)
 > "$tmp_output"
 
-# 병렬 링크 검사 함수
+# 병렬 실행용 함수
 check_url() {
     local url="$1"
     local location="$2"
@@ -51,17 +52,16 @@ check_url() {
 export -f check_url
 export tmp_output
 
-# 병렬 실행 (3개씩)
+# 병렬 검사 (3개씩)
 printf "%s\n" "${!urlLocations[@]}" | \
-    xargs -n1 -P3 -I{} bash -c 'check_url "$@"' _ "{}" "${urlLocations[{}]}"
+    xargs -P3 -I{} bash -c 'check_url "$@"' _ "{}" "${urlLocations[{}]}"
 
-# 결과 출력
 echo
 echo "📄 검사 결과:"
 grep -E "^✅|^⚠️" "$tmp_output" | sort
 echo
 
-# 오류 링크 정리 및 출력
+# 오류 링크 출력 (정리된 출력)
 errors=$(grep "^❌" "$tmp_output")
 if [[ -n "$errors" ]]; then
     echo "‼️ 오류가 발생한 링크 목록:"
