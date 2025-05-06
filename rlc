@@ -1,68 +1,73 @@
 #!/bin/bash
 
-echo "🔍 Markdown 및 MDX 링크 검사 중..."
+echo "🔍 Markdown 및 MDX 파일에서 URL 검사 시작..."
 
-# URL의 위치 정보(파일명:라인번호)를 저장할 associative array (Bash 4 이상 필요)
+# URL 위치 정보를 저장할 associative array
 declare -A urlLocations
 
-# find 명령어로 현재 및 하위 디렉터리의 .md, .mdx 파일들을 찾고,
-# awk를 사용하여 각 파일에서 Markdown 링크 형식([텍스트](URL))의 URL을 추출함.
-# 한 줄에 여러 링크가 포함된 경우도 모두 추출하도록 반복함.
-file_count=0
-total_files=$(find . -type f \( -iname "*.md" -o -iname "*.mdx" \) | wc -l)
-
-# 파일을 하나씩 확인하면서 URL을 추출
-while IFS=: read -r file line url; do
-    # URL이 비어있으면 스킵
-    if [[ -z "$url" ]]; then
-        continue
-    fi
-    if [[ -n "${urlLocations[$url]}" ]]; then
-        urlLocations["$url"]+=", ${file}:${line}"
-    else
-        urlLocations["$url"]="${file}:${line}"
-    fi
-
-    # 진행률 출력
-    file_count=$((file_count + 1))
-    echo -ne "🔗 검사 중... $file_count/$total_files 파일 검사 중\r"
-done < <(
-    find . -type f \( -iname "*.md" -o -iname "*.mdx" \) -exec awk '
-    {
-        remainder = $0;
-        while(match(remainder, /\[[^]]+\]\((https?:\/\/[^)]+)\)/, arr)) {
-            print FILENAME ":" FNR ":" arr[1];
-            remainder = substr(remainder, RSTART + RLENGTH);
-        }
+# 1. Markdown 및 MDX 파일에서 URL 추출
+echo "🔗 파일에서 URL 추출 중..."
+find . -type f \( -iname "*.md" -o -iname "*.mdx" \) -exec awk '
+{
+    remainder = $0;
+    while (match(remainder, /\[[^]]+\]\((https?:\/\/[^)]+)\)/, arr)) {
+        print FILENAME ":" FNR ":" arr[1]; # 파일명, 라인 번호, URL 출력
+        remainder = substr(remainder, RSTART + RLENGTH);
     }
-    ' {} +
-)
+}
+' {} + > extracted_links.txt
 
-echo -e "\n🔗 검사 대상 링크 수: ${#urlLocations[@]}"
-echo
-
-# URL 검사: 각 URL에 대해 curl로 HTTP 상태코드를 받아 검사
-declare -A errorInfo
-for url in "${!urlLocations[@]}"; do
-    status=$(curl -o /dev/null -s -w "%{http_code}" "$url")
-    if [[ "$status" -ge 200 && "$status" -lt 400 ]]; then
-        echo "✅ $url"
-    elif [[ "$status" -ne 000 ]]; then  # 상태 코드가 000이 아니면 오류로 처리
-        echo "❌ $url (상태 코드: $status)"
-        errorInfo["$url"]="$status | 위치: ${urlLocations[$url]}"
+# URL과 위치 정보를 분리
+echo "🔗 추출된 URL 정리 중..."
+while IFS=: read -r file line url; do
+    if [[ -n "$url" ]]; then
+        if [[ -n "${urlLocations[$url]}" ]]; then
+            urlLocations["$url"]+=", ${file}:${line}"
+        else
+            urlLocations["$url"]="${file}:${line}"
+        fi
     fi
-done
+done < extracted_links.txt
 
-# 오류가 발생한 링크 목록 최종 출력
+# URL 리스트 생성
+echo "🔗 중복 제거된 URL 저장..."
+echo "${!urlLocations[@]}" | tr ' ' '\n' > url_list.txt
+
+# 2. URL 검사
+echo "🚀 URL 상태 검사 중..."
+declare -A errorInfo
+
+# 병렬로 curl을 실행하여 상태 코드 확인 (HTTP 429는 무시)
+cat url_list.txt | xargs -P 10 -I {} bash -c '
+    status=$(curl -o /dev/null -s -w "%{http_code}" "{}")
+    if [[ "$status" -ge 400 && "$status" -ne 429 ]]; then
+        echo "❌ {} (상태 코드: $status)"
+        echo "{} $status" >> invalid_urls_tmp.txt
+    elif [[ "$status" -lt 400 ]]; then
+        echo "✅ {}"
+    fi
+'
+
+# 3. 오류 URL 정리
+if [[ -f invalid_urls_tmp.txt ]]; then
+    while IFS=' ' read -r url status; do
+        errorInfo["$url"]="상태 코드: $status | 위치: ${urlLocations[$url]}"
+    done < invalid_urls_tmp.txt
+    rm invalid_urls_tmp.txt
+fi
+
+# 4. 결과 출력
+echo
 if [ ${#errorInfo[@]} -gt 0 ]; then
-    echo
-    echo "‼️ 오류가 발생한 링크 목록:"
+    echo "‼️ 유효하지 않은 URL 목록:"
     echo "────────────────────────────────────────────"
     for url in "${!errorInfo[@]}"; do
         echo "🔗 $url"
-        echo "   └─ 상태 코드: ${errorInfo[$url]}"
+        echo "   └─ ${errorInfo[$url]}"
     done
 else
-    echo
     echo "모든 링크가 정상입니다!"
 fi
+
+# 임시 파일 삭제
+rm extracted_links.txt url_list.txt
