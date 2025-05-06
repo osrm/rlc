@@ -113,65 +113,76 @@ echo -e "${GREEN}발견된 Markdown 파일 수: $FILE_COUNT${NC}"
 # URL 추출
 echo -e "\n${PURPLE}URL 추출 중...${NC}"
 
-# 임시 파일 생성
+# 임시 디렉토리 생성
 TEMP_DIR=$(mktemp -d)
 URL_FILE="$TEMP_DIR/urls.txt"
 RESULTS_FILE="$TEMP_DIR/results.txt"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# URL 추출을 병렬로 처리
-{
-    echo "$MD_FILES" | xargs -I{} -P "$MAX_PARALLEL" bash -c '
-        file="$1"
-        # grep을 한 번만 실행하여 모든 패턴 매칭
-        grep -o -P "\[(.*?)\]\((https?://[^)]+)\)|<(https?://[^>]+)>" "$file" | while read -r line; do
-            if [[ $line =~ \[(.*)\]\((https?://[^)]+) ]]; then
-                # [텍스트](URL) 형식
-                url="${BASH_REMATCH[2]}"
-            elif [[ $line =~ \<(https?://[^>]+) ]]; then
-                # <URL> 형식
-                url="${BASH_REMATCH[1]}"
-            else
-                continue
-            fi
-            
-            # URL 정리 (후행 문자 제거)
-            clean_url=$(echo "$url" | sed -e "s/[,.;:]$//")
-            
-            # 파일 경로와 함께 URL 출력
-            echo "$clean_url|$file"
-        done
-    ' -- {}
-} > "$URL_FILE"
+# URL 추출 함수 - 별도의 파일로 저장하여 실행
+URL_EXTRACT_SCRIPT="$TEMP_DIR/extract.sh"
+cat > "$URL_EXTRACT_SCRIPT" << 'EOF'
+#!/bin/bash
+file="$1"
+
+# 링크 찾기 - 정규식을 직접 사용하지 않고 grep과 sed를 조합
+# 1. Markdown 링크 형식 [text](url)
+grep -o -E '\[[^\]]*\]\(https?://[^)]*\)' "$file" | sed -E 's/\[[^\]]*\]\((https?:\/\/[^)]*)\)/\1/g' > "$2.link1"
+
+# 2. <url> 형식
+grep -o -E '<https?://[^>]*>' "$file" | sed -E 's/<(https?:\/\/[^>]*)>/\1/g' > "$2.link2"
+
+# URL 결합 및 파일 경로 추가
+cat "$2.link1" "$2.link2" | while read -r url; do
+    # URL 정리 (후행 문자 제거)
+    clean_url=$(echo "$url" | sed -e 's/[,.;:]$//')
+    echo "$clean_url|$file"
+done
+
+rm -f "$2.link1" "$2.link2"
+EOF
+
+chmod +x "$URL_EXTRACT_SCRIPT"
+
+# 병렬로 URL 추출
+echo "$MD_FILES" | xargs -I{} -P "$MAX_PARALLEL" bash -c '"$1" "{}" "$2/$(echo "{}" | md5sum | cut -d" " -f1)"' -- "$URL_EXTRACT_SCRIPT" "$TEMP_DIR" > "$URL_FILE"
 
 # URL과 파일 맵 구성 및 무시 패턴 적용
 declare -A URL_MAP
 URL_COUNT=0
 FILTERED_URL_FILE="$TEMP_DIR/filtered_urls.txt"
+> "$FILTERED_URL_FILE"
 
-cat "$URL_FILE" | while read -r line; do
-    IFS="|" read -r url file <<< "$line"
-    
-    # 무시할 패턴인지 확인
-    ignore=false
-    for pattern in "${IGNORE_PATTERNS[@]}"; do
-        if [[ "$url" =~ $pattern ]]; then
-            ignore=true
-            break
+if [ -s "$URL_FILE" ]; then
+    while IFS= read -r line; do
+        IFS='|' read -r url file <<< "$line"
+        
+        # 무시할 패턴인지 확인
+        ignore=false
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            if [[ "$url" =~ $pattern ]]; then
+                ignore=true
+                break
+            fi
+        done
+        
+        if [ "$ignore" = false ]; then
+            echo "$url|$file" >> "$FILTERED_URL_FILE"
+            URL_MAP["$url"]=1
+            ((URL_COUNT++))
         fi
-    done
-    
-    if [ "$ignore" = false ]; then
-        echo "$url|$file" >> "$FILTERED_URL_FILE"
-        URL_MAP["$url"]=1
-        ((URL_COUNT++))
-    fi
-done
+    done < "$URL_FILE"
+fi
 
 # 중복 URL 제거한 파일 생성
 UNIQUE_URL_FILE="$TEMP_DIR/unique_urls.txt"
-sort -u "$FILTERED_URL_FILE" | awk -F'|' '!seen[$1]++ {print $0}' > "$UNIQUE_URL_FILE"
-UNIQUE_URL_COUNT=$(wc -l < "$UNIQUE_URL_FILE")
+if [ -s "$FILTERED_URL_FILE" ]; then
+    sort -u "$FILTERED_URL_FILE" | awk -F'|' '!seen[$1]++ {print $0}' > "$UNIQUE_URL_FILE"
+    UNIQUE_URL_COUNT=$(wc -l < "$UNIQUE_URL_FILE")
+else
+    UNIQUE_URL_COUNT=0
+    touch "$UNIQUE_URL_FILE"
+fi
 
 echo -e "${GREEN}추출된 URL 수: $URL_COUNT (고유 URL: $UNIQUE_URL_COUNT)${NC}"
 
@@ -221,37 +232,57 @@ show_progress() {
 show_progress "$UNIQUE_URL_COUNT" &
 PROGRESS_PID=$!
 
-# 병렬로 URL 검사
-cat "$UNIQUE_URL_FILE" | xargs -I{} -P "$MAX_PARALLEL" bash -c '
-    IFS="|" read -r url file <<< "$1"
-    relative_path=$(realpath --relative-to="$(pwd)" "$file")
-    
-    # curl로 URL 검사
-    status=$(curl -A "$2" -o /dev/null -s -w "%{http_code}" --connect-timeout "$3" --max-time "$3" -L -I "$url" 2>/dev/null)
-    
-    # HEAD 요청 실패 시 GET 요청 시도
-    if [[ $status -ge 400 || $status -eq 0 ]]; then
-        status=$(curl -A "$2" -o /dev/null -s -w "%{http_code}" --connect-timeout "$3" --max-time "$3" -L "$url" 2>/dev/null)
-    fi
-    
-    # 결과 저장
-    if [[ $status -ge 200 && $status -lt 400 ]] || [[ $status -eq 429 ]]; then
-        if [[ $status -eq 429 ]]; then
-            echo "RATE_LIMITED|$status|$url|$relative_path" >> "$4"
-        else
-            echo "SUCCESS|$status|$url|$relative_path" >> "$4"
-        fi
+# URL 검사 스크립트 생성
+URL_CHECK_SCRIPT="$TEMP_DIR/check_url.sh"
+cat > "$URL_CHECK_SCRIPT" << 'EOF'
+#!/bin/bash
+IFS="|" read -r url file <<< "$1"
+user_agent="$2"
+timeout="$3"
+results_file="$4"
+progress_file="$5"
+relative_path=$(realpath --relative-to="$(pwd)" "$file")
+
+# curl로 URL 검사
+status=$(curl -A "$user_agent" -o /dev/null -s -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" -L -I "$url" 2>/dev/null)
+
+# HEAD 요청 실패 시 GET 요청 시도
+if [[ $status -ge 400 || $status -eq 0 ]]; then
+    status=$(curl -A "$user_agent" -o /dev/null -s -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" -L "$url" 2>/dev/null)
+fi
+
+# 결과 저장
+if [[ $status -ge 200 && $status -lt 400 ]] || [[ $status -eq 429 ]]; then
+    if [[ $status -eq 429 ]]; then
+        echo "RATE_LIMITED|$status|$url|$relative_path" >> "$results_file"
     else
-        if [[ $status -eq 0 ]]; then
-            echo "ERROR|접속 실패|$url|$relative_path" >> "$4"
-        else
-            echo "FAIL|$status|$url|$relative_path" >> "$4"
-        fi
+        echo "SUCCESS|$status|$url|$relative_path" >> "$results_file"
     fi
-    
-    # 진행 카운터 증가
-    flock -x "$5" bash -c "echo \$(($(cat \"$5\")+1)) > \"$5\""
-' -- {} "$USER_AGENT" "$TIMEOUT" "$RESULTS_FILE" "$PROGRESS_FILE"
+else
+    if [[ $status -eq 0 ]]; then
+        echo "ERROR|접속 실패|$url|$relative_path" >> "$results_file"
+    else
+        echo "FAIL|$status|$url|$relative_path" >> "$results_file"
+    fi
+fi
+
+# 진행 카운터 증가 (flock을 사용하여 동시 접근 방지)
+if command -v flock >/dev/null 2>&1; then
+    flock -x "$progress_file" bash -c "echo \$(($(cat \"$progress_file\")+1)) > \"$progress_file\""
+else
+    # flock이 없으면 임시 파일을 이용한 대체 방법
+    tmp_count=$(($(cat "$progress_file")+1))
+    echo "$tmp_count" > "$progress_file.tmp"
+    mv "$progress_file.tmp" "$progress_file"
+fi
+EOF
+
+chmod +x "$URL_CHECK_SCRIPT"
+
+# 병렬로 URL 검사
+if [ -s "$UNIQUE_URL_FILE" ]; then
+    cat "$UNIQUE_URL_FILE" | xargs -I{} -P "$MAX_PARALLEL" "$URL_CHECK_SCRIPT" "{}" "$USER_AGENT" "$TIMEOUT" "$RESULTS_FILE" "$PROGRESS_FILE"
+fi
 
 # 진행 바 프로세스 종료
 if [ -n "$PROGRESS_PID" ]; then
@@ -259,15 +290,15 @@ if [ -n "$PROGRESS_PID" ]; then
 fi
 
 # 결과 분석
-if [ -f "$RESULTS_FILE" ]; then
+if [ -f "$RESULTS_FILE" ] && [ -s "$RESULTS_FILE" ]; then
     success_count=$(grep -c "^SUCCESS" "$RESULTS_FILE" || echo 0)
     rate_limited=$(grep -c "^RATE_LIMITED" "$RESULTS_FILE" || echo 0)
     fail_count=$(grep -c "^FAIL" "$RESULTS_FILE" || echo 0)
     error_count=$(grep -c "^ERROR" "$RESULTS_FILE" || echo 0)
     
     # 실패한 URL 목록 추출
+    INVALID_URLS=()
     if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
-        INVALID_URLS=()
         while IFS= read -r line; do
             INVALID_URLS+=("$line")
         done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
@@ -290,13 +321,15 @@ echo -e "  - ${RED}오류${NC}: $error_count"
 if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
     echo -e "\n${CYAN}유효하지 않은 URL 목록:${NC}"
     
-    while IFS= read -r line; do
-        IFS="|" read -r status url file <<< "$line"
-        echo -e "${RED}✘${NC} $url"
-        echo -e "  위치: $file"
-        echo -e "  상태: $status"
-        echo
-    done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+    if [ -f "$RESULTS_FILE" ]; then
+        while IFS= read -r line; do
+            IFS="|" read -r status url file <<< "$line"
+            echo -e "${RED}✘${NC} $url"
+            echo -e "  위치: $file"
+            echo -e "  상태: $status"
+            echo
+        done < <(grep -E "^(FAIL|ERROR)" "$RESULTS_FILE" | cut -d'|' -f2-)
+    fi
 fi
 
 # 결과 파일 저장
@@ -310,7 +343,7 @@ if [ -n "$OUTPUT_FILE" ]; then
     echo "  - 오류: $error_count" >> "$OUTPUT_FILE"
     echo >> "$OUTPUT_FILE"
     
-    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ]; then
+    if [ "$fail_count" -gt 0 ] || [ "$error_count" -gt 0 ] && [ -f "$RESULTS_FILE" ]; then
         echo "유효하지 않은 URL 목록:" >> "$OUTPUT_FILE"
         echo >> "$OUTPUT_FILE"
         
