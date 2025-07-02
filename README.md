@@ -1,4 +1,4 @@
-# rlc
+# How to use rlc
 
 git clone
 
