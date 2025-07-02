@@ -1,4 +1,4 @@
-# rlc test
+# rlc
 
 git clone
 
